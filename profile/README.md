@@ -1,19 +1,18 @@
 # LOJIK Labs
 
-LOJIK is an accountable systems-delivery firm for recurring work that software should handle better.
+**Find the break. Build the right system. Know it works.**
 
-We start with the operational break—not a predetermined technology. We map the workflow, people, data, integrations, permissions, failure behavior, acceptance criteria, and operating owner. Then we define the complete system, implement it professionally, prove acceptance, launch it, and remain accountable after delivery.
+Lojik Labs is a founder-led software studio for small and mid-size businesses. We find the workflow that's slowing a business down, build the software, automation or AI system that fixes it, and prove it works before we hand it over.
 
-The result may include customer-facing software, internal tools, workflow automation, integrations, data systems, or AI-assisted operations.
+- **Start with a Workflow Review.** It costs USD 1,500, credited to your build. Builds are fixed-price, quoted after the review. [wearelojik.com](https://wearelojik.com/?utm_source=github)
+- **We ship our own products.** [Intertitle](https://intertitle.app/?utm_source=github), a film diary with picks from your taste, is live on the [App Store](https://apps.apple.com/app/id6775606124) in English and Spanish.
+- **Founder-led.** Diego and Mariano González Zapiain scope and deliver every engagement. AI coding agents do the implementation under their review.
 
-## What we deliver
+We're not a dev shop billing hours, an AI-agents-only service, or a SaaS product.
 
-- A clear system plan tied to the real operating problem
-- Professional implementation across software, data, and integrations
-- Acceptance evidence that the system works
-- An explicit operating owner and defined failure and recovery behavior
-- Ongoing accountability after launch
+## The company
 
-We are not generic AI access, a prompt library, a chatbot wrapper, or unfinished code handed off as a product.
+LOJIK LABS LLC is a Wisconsin limited liability company (DFI entity L087735, organized February 2026) with its team in Mexico City. We work in English and Spanish.
 
-[Start with a business systems review](https://wearelojik.com)
+- [How we work, terms and security](https://wearelojik.com/trust)
+- [The founders](https://wearelojik.com/about)
