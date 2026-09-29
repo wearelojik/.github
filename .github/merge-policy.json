@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "mode": "native",
+  "bot_slug": "dgz-merge-bot",
+  "bot_app_id": 5124966,
+  "required_checks": [],
+  "watch": {
+    "ci_workflows": [],
+    "deploy_environments": [],
+    "health_urls": [],
+    "watch_minutes": 10,
+    "auto_revert": true
+  }
+}

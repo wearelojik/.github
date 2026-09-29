@@ -1,0 +1,213 @@
+name: merge-gate
+
+# Vendored from dgonzap30/merge-policy by `merge-policy install`. Edit the
+# source and re-install; do not edit this copy. Owner tier: a PR that changes
+# this file, .github/merge-policy.json or .github/merge-policy/ never arms
+# without the owner's merge:approve label, and pull_request_target always runs
+# the BASE branch's copy.
+#
+# Flow: classify (tier from paths/content) -> review (AI verdicts, posted by
+# the merge-bot App as merge-review/<name> check runs on the head SHA) ->
+# merge-gate-runner, which arms GitHub auto-merge when the tier's
+# evidence is complete (disarms otherwise) and posts the one required check,
+# `merge-gate`, as the merge-bot App on the head SHA. The ruleset accepts
+# merge-gate from the App only: a workflow job named merge-gate counts for
+# nothing, and a run that fails before posting leaves it pending (closed).
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, labeled, unlabeled, edited]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to re-evaluate
+        required: true
+        type: number
+
+
+permissions: {}
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: ${{ github.event.action == 'synchronize' }}
+
+jobs:
+  classify:
+    name: classify
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write # disarm auto-merge the moment a new head arrives
+      issues: read
+      checks: read # cached verdicts: the App's merge-review/* check runs
+    outputs:
+      skip: ${{ steps.c.outputs.skip }}
+      pr: ${{ steps.c.outputs.pr }}
+      head_sha: ${{ steps.c.outputs.head_sha }}
+      base_sha: ${{ steps.c.outputs.base_sha }}
+      tier: ${{ steps.c.outputs.tier }}
+      reviewers: ${{ steps.c.outputs.reviewers }}
+      reviewers_needed: ${{ steps.c.outputs.reviewers_needed }}
+      reasons: ${{ steps.c.outputs.reasons }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 — base branch: the trusted rules
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: c
+        run: node .github/merge-policy/run-gate.mjs classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr }}
+
+  review:
+    name: review (${{ matrix.reviewer.name }})
+    needs: classify
+    if: needs.classify.outputs.skip == 'false' && needs.classify.outputs.reviewers_needed != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The Claude tokens and the App key are merge-bot environment secrets:
+    # only jobs on the default branch's ref (pull_request_target into it,
+    # workflow_run, a dispatch on it) get them. A run of a merge-gate.yml copy
+    # from another branch cannot, so it cannot post a verdict as the App.
+    environment:
+      name: merge-bot
+      deployment: false
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        reviewer: ${{ fromJSON(needs.classify.outputs.reviewers_needed) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 — base branch; the head is fetched as data
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # review.mjs checks the head out into a /tmp worktree with symlinks off
+      # for the reviewer to read (Read/Grep/Glob only); nothing from it runs.
+      - name: Fetch the PR head as git objects (never executed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+        run: |
+          gh auth setup-git
+          git fetch --no-tags origin "$HEAD_SHA"
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.284
+      - name: Review
+        run: node .github/merge-policy/review.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEWER: ${{ matrix.reviewer.name }}
+          MODEL: ${{ matrix.reviewer.model }}
+          EFFORT: ${{ matrix.reviewer.effort }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          BASE_SHA: ${{ needs.classify.outputs.base_sha }}
+          TIER: ${{ needs.classify.outputs.tier }}
+          REASONS: ${{ needs.classify.outputs.reasons }}
+          REVIEW_OUT: review-out
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN_2: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
+          CLAUDE_CODE_OAUTH_TOKEN_3: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_3 }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # The App token exists only after the reviewer is gone: no Claude
+      # process may outlive the Review step into the steps that hold it.
+      - name: No reviewer process left
+        id: clear
+        if: always()
+        run: |
+          pat='anthropic-ai/claude-code|(^|/)claude( |$)'
+          pkill -9 -f "$pat" || true
+          sleep 1
+          if pgrep -fa "$pat"; then echo "::error::a Claude process outlived the review step"; exit 1; fi
+      - name: Mint the merge-bot token
+        id: bot
+        if: always() && steps.clear.outcome == 'success' && vars.MERGE_BOT_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          permission-checks: write # the merge-review/<name> verdict check run
+      - name: Post the verdict as the merge-bot App
+        if: always() && steps.clear.outcome == 'success'
+        run: node .github/merge-policy/review.mjs post
+        env:
+          MERGE_TOKEN: ${{ steps.bot.outputs.token }}
+          REVIEWER: ${{ matrix.reviewer.name }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          REVIEW_OUT: review-out
+      # A record of the review and the sticky comment's findings; never evidence.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: review-${{ matrix.reviewer.name }}
+          path: review-out/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  merge-gate-runner:
+    # Not the required check: the App posts `merge-gate` from the Decide step.
+    name: merge-gate-runner
+    needs: [classify, review]
+    # Always runs: it must post a failing merge-gate check when anything
+    # before it failed.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: merge-bot
+      deployment: false
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: read # the App's merge-review/* verdicts; required CI in direct mode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.classify.outputs.skip == 'false' && needs.classify.outputs.reviewers_needed != '[]'
+        continue-on-error: true
+        with:
+          pattern: review-*
+          path: review-in
+      - name: Mint the merge-bot token
+        id: bot
+        if: (needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')) && vars.MERGE_BOT_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: write # the merge-gate check run
+      - name: Fail closed when classification did not complete
+        if: needs.classify.result != 'success' && github.event_name != 'workflow_run'
+        run: node .github/merge-policy/run-gate.mjs fail-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_TOKEN: ${{ steps.bot.outputs.token }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha || github.event.pull_request.head.sha }}
+          REASON: classify ended ${{ needs.classify.result }}
+      - name: Decide
+        if: needs.classify.result == 'success' && needs.classify.outputs.skip == 'false'
+        run: node .github/merge-policy/run-gate.mjs decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_TOKEN: ${{ steps.bot.outputs.token }}
+          MERGE_BOT_LOGIN: ${{ steps.bot.outputs.app-slug && format('{0}[bot]', steps.bot.outputs.app-slug) || '' }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          TIER: ${{ needs.classify.outputs.tier }}
+          REASONS: ${{ needs.classify.outputs.reasons }}
+          REVIEWERS: ${{ needs.classify.outputs.reviewers }}
+          REVIEW_DIR: review-in
