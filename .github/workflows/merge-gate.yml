@@ -1,13 +1,17 @@
 name: merge-gate
 
-# Vendored from dgonzap30/merge-policy by `merge-policy install`. Edit the
-# source and re-install; do not edit this copy. Owner tier: a PR that changes
-# this file, .github/merge-policy.json or .github/merge-policy/ never arms
-# without the owner's merge:approve label, and pull_request_target always runs
-# the BASE branch's copy.
+# Installed by `merge-policy install` from dgonzap30/merge-policy. The engine
+# is not vendored: each job fetches it from that private repository at the
+# stable channel (a release tag on its main) with a read-only
+# merge-bot token, so an engine release reaches this repo without a PR. Edit
+# the source and re-install; do not edit this copy. Owner tier: a PR that
+# changes this file or .github/merge-policy.json never arms without the
+# owner's merge:approve label, and pull_request_target always runs the BASE
+# branch's copy, so a channel or template change takes effect only once merged.
 #
 # Flow: classify (tier from paths/content) -> review (AI verdicts, posted by
-# the merge-bot App as merge-review/<name> check runs on the head SHA) ->
+# the merge-bot App as merge-review/<name> check runs on the head SHA; a pass
+# whose change a new head repeats exactly is carried to it instead) ->
 # merge-gate-runner, which arms GitHub auto-merge when the tier's
 # evidence is complete (disarms otherwise) and posts the one required check,
 # `merge-gate`, as the merge-bot App on the head SHA. The ruleset accepts
@@ -23,25 +27,52 @@ on:
         description: Pull request number to re-evaluate
         required: true
         type: number
+      dry_run:
+        # Classify and decide only: no review runs, no App write token is
+        # minted, and nothing is posted, armed, labeled or commented.
+        description: Decide without reviewing or posting anything
+        required: false
+        default: false
+        type: boolean
 
 
 permissions: {}
 
+# An event that brings no new head and cannot change the decision (a label
+# the gate never reads, a body edit, a CI run that was not a pull_request run;
+# IDLE_EVENT_IF in src/gate.mjs) runs no job: the merge-gate check the App
+# posted for this head stands. Such a run takes a group of its own, so it can
+# never displace a pending run that does decide. A dry run takes its own group
+# too: it must never cancel a real one. A pull_request CI run's re-evaluation
+# joins its PR's group (the number run-gate decides for), so it cannot review
+# alongside the PR event's run on the same head; only a payload with no PR (a
+# fork) falls back to its branch, prefixed so a branch named like a number
+# never lands in that PR's group.
 concurrency:
-  group: merge-gate-${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.head_branch || github.run_id }}
+  group: merge-gate-${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.event != 'pull_request' || github.event_name == 'pull_request_target' && ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != '' && !(startsWith(github.event.label.name, 'merge:') && github.event.label.name != 'merge:armed' && github.event.label.name != 'merge:owner' && github.event.label.name != 'merge:changes') || github.event.action == 'unlabeled' && github.event.label.name == 'merge:retry' || github.event.action == 'edited' && !github.event.changes.base && !github.event.changes.title && !(github.event.changes.body && startsWith(github.event.pull_request.title, 'Revert "')))) || inputs.dry_run == true) && format('idle-{0}', github.run_id) || github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch && format('branch-{0}', github.event.workflow_run.head_branch) || github.run_id }}
   cancel-in-progress: ${{ github.event.action == 'synchronize' }}
 
 jobs:
   classify:
     name: classify
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # IDLE_EVENT_IF alone decides (it also skips a CI run that was not a
+    # pull_request run), as in the concurrency group. success() has no needs
+    # to read here; it only keeps the line from starting with YAML's `!`.
+    if: success() && !(github.event_name == 'workflow_run' && github.event.workflow_run.event != 'pull_request' || github.event_name == 'pull_request_target' && ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != '' && !(startsWith(github.event.label.name, 'merge:') && github.event.label.name != 'merge:armed' && github.event.label.name != 'merge:owner' && github.event.label.name != 'merge:changes') || github.event.action == 'unlabeled' && github.event.label.name == 'merge:retry' || github.event.action == 'edited' && !github.event.changes.base && !github.event.changes.title && !(github.event.changes.body && startsWith(github.event.pull_request.title, 'Revert "'))))
+    runs-on: ${{ vars.MERGE_POLICY_RUNNER || 'ubuntu-latest' }}
+    # Carry-forward fetches the PR's history (no blobs) into a throwaway repo.
+    timeout-minutes: 10
+    # The App key here mints the engine-read token, and a write token only
+    # when that fetch failed (the fail-closed step, which runs no engine
+    # code). No model credential reaches this job.
+    environment:
+      name: merge-bot
+      deployment: false
     permissions:
-      contents: read
-      pull-requests: write # disarm auto-merge the moment a new head arrives
+      contents: read # also the carry-forward fetch: git objects as data, never checked out or run
+      pull-requests: write # drop merge:approve when a new head arrives (the runner disarms, with the App)
       issues: read
-      checks: read # cached verdicts: the App's merge-review/* check runs
+      checks: read # cached and carried verdicts: the App's merge-review/* check runs
     outputs:
       skip: ${{ steps.c.outputs.skip }}
       pr: ${{ steps.c.outputs.pr }}
@@ -50,25 +81,136 @@ jobs:
       tier: ${{ steps.c.outputs.tier }}
       reviewers: ${{ steps.c.outputs.reviewers }}
       reviewers_needed: ${{ steps.c.outputs.reviewers_needed }}
+      carried: ${{ steps.c.outputs.carried }}
+      review_guides: ${{ steps.c.outputs.review_guides }}
       reasons: ${{ steps.c.outputs.reasons }}
+      # Later jobs run this exact engine commit, whatever a release does meanwhile.
+      engine_sha: ${{ steps.engine.outputs.sha }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 — base branch: the trusted rules
+      # Base branch: the trusted rules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 2
         with:
           persist-credentials: false
           sparse-checkout: .github
+      # The shared engine: dgonzap30/merge-policy at the stable channel,
+      # fetched with a merge-bot token that can read that one repository and
+      # nothing else, revoked when the fetch ends (src/engine.mjs).
+      - name: Mint the engine-read token
+        id: engine-token
+        timeout-minutes: 1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          owner: dgonzap30
+          repositories: merge-policy
+          permission-contents: read
+          skip-token-revoke: true # the fetch revokes it before any later step runs
+      - name: Fetch the merge-policy engine
+        id: engine
+        # A stall fails the step (curl limits, then this backstop), so the
+        # fail-closed steps below still run; a job timeout would cancel them.
+        timeout-minutes: 2
+        env:
+          ENGINE_TOKEN: ${{ steps.engine-token.outputs.token }}
+          ENGINE_REF: stable
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/dgonzap30/merge-policy"
+          hdr=(-H "Authorization: Bearer $ENGINE_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          lim=(--connect-timeout 10 --max-time 20)
+          revoke() { curl -fsS -o /dev/null -X DELETE "${hdr[@]}" "${lim[@]}" https://api.github.com/installation/token || echo "::warning::engine token not revoked (it expires within the hour)"; }
+          trap revoke EXIT
+          field() { node -e 'const j = JSON.parse(require("fs").readFileSync(0, "utf8")); const v = process.argv[1].split(".").reduce((o, k) => o?.[k], j); if (typeof v !== "string") process.exit(1); console.log(v)' "$1"; }
+          if [[ "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$ENGINE_REF"
+          elif [[ "$ENGINE_REF" =~ ^(canary|stable)$ ]]; then
+            ref=$(curl -fsS "${hdr[@]}" "${lim[@]}" "$api/git/ref/tags/$ENGINE_REF")
+            if [ "$(printf '%s' "$ref" | field object.type)" != commit ]; then echo "::error::engine channel $ENGINE_REF is not a lightweight tag on a commit"; exit 1; fi
+            sha=$(printf '%s' "$ref" | field object.sha)
+          else
+            echo "::error::engine ref must be a channel (canary, stable) or a full commit SHA"; exit 1
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::engine ref did not resolve to a commit"; exit 1; }
+          status=$(curl -fsS "${hdr[@]}" "${lim[@]}" "$api/compare/main...$sha" | field status)
+          case "$status" in behind|identical) ;; *) echo "::error::engine $sha is not on merge-policy main ($status)"; exit 1 ;; esac
+          dir="$RUNNER_TEMP/merge-policy"
+          rm -rf "$dir" && mkdir -p "$dir"
+          curl -fsSL "${hdr[@]}" --connect-timeout 10 --max-time 45 "$api/tarball/$sha" | tar -xz -C "$dir" --strip-components=1
+          test -f "$dir/src/run-gate.mjs"
+          claude_code=$(field claude_code_version < "$dir/engine.json")
+          [[ "$claude_code" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::engine.json claude_code_version is not x.y.z"; exit 1; }
+          codex=$(field codex_version < "$dir/engine.json")
+          [[ "$codex" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::engine.json codex_version is not x.y.z"; exit 1; }
+          { echo "sha=$sha"; echo "dir=$dir"; echo "claude_code=$claude_code"; echo "codex=$codex"; } >> "$GITHUB_OUTPUT"
+          echo "merge-policy engine $sha ($ENGINE_REF)"
       - id: c
-        run: node .github/merge-policy/run-gate.mjs classify
+        run: node "$RUNNER_TEMP/merge-policy/src/run-gate.mjs" classify
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr }}
+      # The engine could not be fetched: nothing above decided. Post a failing
+      # merge-gate and disarm auto-merge without it (src/engine.mjs), so an
+      # earlier success or arming on this head cannot stand.
+      - name: Mint the merge-bot token (no engine)
+        id: fallback-bot
+        if: failure() && steps.engine.outcome != 'success' && inputs.dry_run != true && vars.MERGE_BOT_CLIENT_ID != ''
+        timeout-minutes: 1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write # disarm auto-merge
+          permission-checks: write # the failing merge-gate check run
+      - name: Fail closed without the engine
+        if: failure() && steps.engine.outcome != 'success' && inputs.dry_run != true
+        timeout-minutes: 1
+        env:
+          MERGE_TOKEN: ${{ steps.fallback-bot.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          echo "::error::the merge-policy engine could not be fetched: failing closed"
+          if [ -z "${MERGE_TOKEN:-}" ]; then echo "::error::no merge-bot token: no merge-gate check posted and auto-merge not disarmed"; exit 1; fi
+          api="https://api.github.com/repos/$REPO"
+          hdr=(--connect-timeout 5 --max-time 15 -H "Authorization: Bearer $MERGE_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          pick() { node -e 'const j = JSON.parse(require("fs").readFileSync(0, "utf8")); const v = process.argv[1].split(".").reduce((o, k) => o?.[k], j); console.log(typeof v === "string" ? v : v ? "yes" : "")' "$1"; }
+          sha="${HEAD_SHA:-}"
+          node_id=""
+          armed=""
+          if [[ "${PR_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+            if pr=$(curl -fsS "${hdr[@]}" "$api/pulls/$PR_NUMBER"); then
+              [ -n "$sha" ] || sha=$(printf '%s' "$pr" | pick head.sha)
+              node_id=$(printf '%s' "$pr" | pick node_id)
+              armed=$(printf '%s' "$pr" | pick auto_merge)
+            else
+              echo "::error::could not read PR #$PR_NUMBER: auto-merge not checked"
+            fi
+          fi
+          if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            body=$(node -e 'console.log(JSON.stringify({ name: "merge-gate", head_sha: process.argv[1], status: "completed", conclusion: "failure", details_url: process.argv[2], output: { title: "merge-gate failed closed: the merge-policy engine could not be fetched", summary: "Nothing decided this head, so it may not merge. Run: " + process.argv[2] } }))' "$sha" "$RUN_URL")
+            if curl -fsS -o /dev/null -X POST "${hdr[@]}" "$api/check-runs" -d "$body"; then echo "failing merge-gate posted on $sha"; else echo "::error::posting the failing merge-gate check failed"; fi
+          else
+            echo "::error::no head SHA: no merge-gate check posted"
+          fi
+          if [ -n "$armed" ] && [ -n "$node_id" ]; then
+            q=$(node -e 'console.log(JSON.stringify({ query: "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", variables: { id: process.argv[1] } }))' "$node_id")
+            if res=$(curl -fsS -X POST "${hdr[@]}" https://api.github.com/graphql -d "$q") && printf '%s' "$res" | node -e 'process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).errors ? 1 : 0)'; then echo "auto-merge disarmed"; else echo "::error::disarming auto-merge failed"; fi
+          fi
+          exit 1
 
   review:
     name: review (${{ matrix.reviewer.name }})
     needs: classify
-    if: needs.classify.outputs.skip == 'false' && needs.classify.outputs.reviewers_needed != '[]'
-    runs-on: ubuntu-latest
+    if: needs.classify.outputs.skip == 'false' && needs.classify.outputs.reviewers_needed != '[]' && inputs.dry_run != true
+    runs-on: ${{ vars.MERGE_POLICY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
-    # The Claude tokens and the App key are merge-bot environment secrets:
+    # The model credentials (Claude tokens, OPENAI_API_KEY) and the App key are merge-bot environment secrets:
     # only jobs on the default branch's ref (pull_request_target into it,
     # workflow_run, a dispatch on it) get them. A run of a merge-gate.yml copy
     # from another branch cannot, so it cannot post a verdict as the App.
@@ -83,7 +225,8 @@ jobs:
       matrix:
         reviewer: ${{ fromJSON(needs.classify.outputs.reviewers_needed) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 — base branch; the head is fetched as data
+      # Base branch; the head is fetched as data.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -96,10 +239,69 @@ jobs:
         run: |
           gh auth setup-git
           git fetch --no-tags origin "$HEAD_SHA"
+      # Before the reviewer starts: its token is revoked by then, and the
+      # engine sits under $RUNNER_TEMP, in /home, which the reviewer may not read.
+      # The shared engine: dgonzap30/merge-policy at classify's commit (the channel when classify did not finish),
+      # fetched with a merge-bot token that can read that one repository and
+      # nothing else, revoked when the fetch ends (src/engine.mjs).
+      - name: Mint the engine-read token
+        id: engine-token
+        timeout-minutes: 1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          owner: dgonzap30
+          repositories: merge-policy
+          permission-contents: read
+          skip-token-revoke: true # the fetch revokes it before any later step runs
+      - name: Fetch the merge-policy engine
+        id: engine
+        # A stall fails the step (curl limits, then this backstop), so the
+        # fail-closed steps below still run; a job timeout would cancel them.
+        timeout-minutes: 2
+        env:
+          ENGINE_TOKEN: ${{ steps.engine-token.outputs.token }}
+          ENGINE_REF: ${{ needs.classify.outputs.engine_sha || 'stable' }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/dgonzap30/merge-policy"
+          hdr=(-H "Authorization: Bearer $ENGINE_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          lim=(--connect-timeout 10 --max-time 20)
+          revoke() { curl -fsS -o /dev/null -X DELETE "${hdr[@]}" "${lim[@]}" https://api.github.com/installation/token || echo "::warning::engine token not revoked (it expires within the hour)"; }
+          trap revoke EXIT
+          field() { node -e 'const j = JSON.parse(require("fs").readFileSync(0, "utf8")); const v = process.argv[1].split(".").reduce((o, k) => o?.[k], j); if (typeof v !== "string") process.exit(1); console.log(v)' "$1"; }
+          if [[ "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$ENGINE_REF"
+          elif [[ "$ENGINE_REF" =~ ^(canary|stable)$ ]]; then
+            ref=$(curl -fsS "${hdr[@]}" "${lim[@]}" "$api/git/ref/tags/$ENGINE_REF")
+            if [ "$(printf '%s' "$ref" | field object.type)" != commit ]; then echo "::error::engine channel $ENGINE_REF is not a lightweight tag on a commit"; exit 1; fi
+            sha=$(printf '%s' "$ref" | field object.sha)
+          else
+            echo "::error::engine ref must be a channel (canary, stable) or a full commit SHA"; exit 1
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::engine ref did not resolve to a commit"; exit 1; }
+          status=$(curl -fsS "${hdr[@]}" "${lim[@]}" "$api/compare/main...$sha" | field status)
+          case "$status" in behind|identical) ;; *) echo "::error::engine $sha is not on merge-policy main ($status)"; exit 1 ;; esac
+          dir="$RUNNER_TEMP/merge-policy"
+          rm -rf "$dir" && mkdir -p "$dir"
+          curl -fsSL "${hdr[@]}" --connect-timeout 10 --max-time 45 "$api/tarball/$sha" | tar -xz -C "$dir" --strip-components=1
+          test -f "$dir/src/run-gate.mjs"
+          claude_code=$(field claude_code_version < "$dir/engine.json")
+          [[ "$claude_code" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::engine.json claude_code_version is not x.y.z"; exit 1; }
+          codex=$(field codex_version < "$dir/engine.json")
+          [[ "$codex" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::engine.json codex_version is not x.y.z"; exit 1; }
+          { echo "sha=$sha"; echo "dir=$dir"; echo "claude_code=$claude_code"; echo "codex=$codex"; } >> "$GITHUB_OUTPUT"
+          echo "merge-policy engine $sha ($ENGINE_REF)"
       - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code@2.1.284
+        # The cross reviewer calls the OpenAI Responses API from review.mjs with no tools.
+        if: matrix.reviewer.name != 'cross'
+        env:
+          CLAUDE_CODE_VERSION: ${{ steps.engine.outputs.claude_code }}
+        run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
       - name: Review
-        run: node .github/merge-policy/review.mjs
+        id: review
+        run: node "$RUNNER_TEMP/merge-policy/src/review.mjs"
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEWER: ${{ matrix.reviewer.name }}
@@ -110,21 +312,52 @@ jobs:
           BASE_SHA: ${{ needs.classify.outputs.base_sha }}
           TIER: ${{ needs.classify.outputs.tier }}
           REASONS: ${{ needs.classify.outputs.reasons }}
+          # Names only: review.mjs reads each guide from BASE_SHA's tree, never from the head.
+          REVIEW_GUIDES: ${{ needs.classify.outputs.review_guides }}
+          # A follow-up review (src/delta.mjs): the earlier verdict's head, depth
+          # and findings, or null for a review of the whole PR.
+          DELTA: ${{ toJSON(matrix.reviewer.delta) }}
           REVIEW_OUT: review-out
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          CLAUDE_CODE_OAUTH_TOKEN_2: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
-          CLAUDE_CODE_OAUTH_TOKEN_3: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_3 }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_FALLBACK: ${{ matrix.reviewer.name != 'cross' && secrets.CODEX_AUTH_JSON != '' && 'available' || '' }}
+          # Each reviewer gets only its own provider's credential.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ matrix.reviewer.name != 'cross' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN_2: ${{ matrix.reviewer.name != 'cross' && secrets.CLAUDE_CODE_OAUTH_TOKEN_2 || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN_3: ${{ matrix.reviewer.name != 'cross' && secrets.CLAUDE_CODE_OAUTH_TOKEN_3 || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN_4: ${{ matrix.reviewer.name != 'cross' && secrets.CLAUDE_CODE_OAUTH_TOKEN_4 || '' }}
+          CLAUDE_CODE_OAUTH_TOKEN_5: ${{ matrix.reviewer.name != 'cross' && secrets.CLAUDE_CODE_OAUTH_TOKEN_5 || '' }}
+          ANTHROPIC_API_KEY: ${{ matrix.reviewer.name != 'cross' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ matrix.reviewer.name == 'cross' && secrets.OPENAI_API_KEY || '' }}
+      - name: Install Codex CLI
+        if: steps.review.outputs.codex_fallback == 'true'
+        env:
+          CODEX_VERSION: ${{ steps.engine.outputs.codex }}
+        run: npm install -g "@openai/codex@$CODEX_VERSION"
+      - name: Codex fallback review
+        if: steps.review.outputs.codex_fallback == 'true'
+        run: node "$RUNNER_TEMP/merge-policy/src/review.mjs" codex
+        env:
+          REVIEWER: ${{ matrix.reviewer.name }}
+          MODEL: ${{ matrix.reviewer.model }}
+          EFFORT: ${{ matrix.reviewer.effort }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          BASE_SHA: ${{ needs.classify.outputs.base_sha }}
+          TIER: ${{ needs.classify.outputs.tier }}
+          REASONS: ${{ needs.classify.outputs.reasons }}
+          REVIEW_GUIDES: ${{ needs.classify.outputs.review_guides }}
+          DELTA: ${{ toJSON(matrix.reviewer.delta) }}
+          REVIEW_OUT: review-out
+          CODEX_AUTH_JSON: ${{ matrix.reviewer.name != 'cross' && secrets.CODEX_AUTH_JSON || '' }}
       # The App token exists only after the reviewer is gone: no Claude
       # process may outlive the Review step into the steps that hold it.
       - name: No reviewer process left
         id: clear
         if: always()
         run: |
-          pat='anthropic-ai/claude-code|(^|/)claude( |$)'
+          pat='anthropic-ai/claude-code|(^|/)claude( |$)|@openai/codex|(^|/)codex( |$)'
           pkill -9 -f "$pat" || true
           sleep 1
-          if pgrep -fa "$pat"; then echo "::error::a Claude process outlived the review step"; exit 1; fi
+          if pgrep -fa "$pat"; then echo "::error::a reviewer process outlived the review step"; exit 1; fi
       - name: Mint the merge-bot token
         id: bot
         if: always() && steps.clear.outcome == 'success' && vars.MERGE_BOT_CLIENT_ID != ''
@@ -134,13 +367,18 @@ jobs:
           private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
           permission-checks: write # the merge-review/<name> verdict check run
       - name: Post the verdict as the merge-bot App
-        if: always() && steps.clear.outcome == 'success'
-        run: node .github/merge-policy/review.mjs post
+        if: always() && steps.clear.outcome == 'success' && steps.engine.outcome == 'success'
+        run: node "$RUNNER_TEMP/merge-policy/src/review.mjs" post
         env:
           MERGE_TOKEN: ${{ steps.bot.outputs.token }}
           REVIEWER: ${{ matrix.reviewer.name }}
           PR_NUMBER: ${{ needs.classify.outputs.pr }}
           HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          # The base the reviewer diffed against, bound into the verdict: a pass
+          # carries to a later head only while the PR's merge-base is unchanged.
+          BASE_SHA: ${{ needs.classify.outputs.base_sha }}
+          # Bound into the verdict only when the record says the follow-up ran.
+          DELTA: ${{ toJSON(matrix.reviewer.delta) }}
           REVIEW_OUT: review-out
       # A record of the review and the sticky comment's findings; never evidence.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -155,11 +393,14 @@ jobs:
     # Not the required check: the App posts `merge-gate` from the Decide step.
     name: merge-gate-runner
     needs: [classify, review]
-    # Always runs: it must post a failing merge-gate check when anything
-    # before it failed.
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Runs whenever classify was due, whatever became of it: it must post a
+    # failing merge-gate check when anything before it failed. Only an idle
+    # event, on which classify was never due, skips it.
+    if: always() && !(github.event_name == 'workflow_run' && github.event.workflow_run.event != 'pull_request' || github.event_name == 'pull_request_target' && ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != '' && !(startsWith(github.event.label.name, 'merge:') && github.event.label.name != 'merge:armed' && github.event.label.name != 'merge:owner' && github.event.label.name != 'merge:changes') || github.event.action == 'unlabeled' && github.event.label.name == 'merge:retry' || github.event.action == 'edited' && !github.event.changes.base && !github.event.changes.title && !(github.event.changes.body && startsWith(github.event.pull_request.title, 'Revert "'))))
+    runs-on: ${{ vars.MERGE_POLICY_RUNNER || 'ubuntu-latest' }}
+    # Room for a stalled engine fetch to time out as a step (a failure) and
+    # for the fail-closed steps after it: checkout + 1 + 2 + 1 + 1 minutes.
+    timeout-minutes: 8
     environment:
       name: merge-bot
       deployment: false
@@ -168,39 +409,111 @@ jobs:
       pull-requests: write
       issues: write
       checks: read # the App's merge-review/* verdicts; required CI in direct mode
+      actions: read # the red-main hold: main's push CI runs and their jobs (src/watch.mjs mainState)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')
+        timeout-minutes: 2
         with:
           persist-credentials: false
           sparse-checkout: .github
+      # The shared engine: dgonzap30/merge-policy at classify's commit (the channel when classify did not finish),
+      # fetched with a merge-bot token that can read that one repository and
+      # nothing else, revoked when the fetch ends (src/engine.mjs).
+      - name: Mint the engine-read token
+        id: engine-token
+        if: needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')
+        timeout-minutes: 1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          owner: dgonzap30
+          repositories: merge-policy
+          permission-contents: read
+          skip-token-revoke: true # the fetch revokes it before any later step runs
+      - name: Fetch the merge-policy engine
+        id: engine
+        if: needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')
+        # A stall fails the step (curl limits, then this backstop), so the
+        # fail-closed steps below still run; a job timeout would cancel them.
+        timeout-minutes: 2
+        env:
+          ENGINE_TOKEN: ${{ steps.engine-token.outputs.token }}
+          ENGINE_REF: ${{ needs.classify.outputs.engine_sha || 'stable' }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/dgonzap30/merge-policy"
+          hdr=(-H "Authorization: Bearer $ENGINE_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          lim=(--connect-timeout 10 --max-time 20)
+          revoke() { curl -fsS -o /dev/null -X DELETE "${hdr[@]}" "${lim[@]}" https://api.github.com/installation/token || echo "::warning::engine token not revoked (it expires within the hour)"; }
+          trap revoke EXIT
+          field() { node -e 'const j = JSON.parse(require("fs").readFileSync(0, "utf8")); const v = process.argv[1].split(".").reduce((o, k) => o?.[k], j); if (typeof v !== "string") process.exit(1); console.log(v)' "$1"; }
+          if [[ "$ENGINE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$ENGINE_REF"
+          elif [[ "$ENGINE_REF" =~ ^(canary|stable)$ ]]; then
+            ref=$(curl -fsS "${hdr[@]}" "${lim[@]}" "$api/git/ref/tags/$ENGINE_REF")
+            if [ "$(printf '%s' "$ref" | field object.type)" != commit ]; then echo "::error::engine channel $ENGINE_REF is not a lightweight tag on a commit"; exit 1; fi
+            sha=$(printf '%s' "$ref" | field object.sha)
+          else
+            echo "::error::engine ref must be a channel (canary, stable) or a full commit SHA"; exit 1
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::engine ref did not resolve to a commit"; exit 1; }
+          status=$(curl -fsS "${hdr[@]}" "${lim[@]}" "$api/compare/main...$sha" | field status)
+          case "$status" in behind|identical) ;; *) echo "::error::engine $sha is not on merge-policy main ($status)"; exit 1 ;; esac
+          dir="$RUNNER_TEMP/merge-policy"
+          rm -rf "$dir" && mkdir -p "$dir"
+          curl -fsSL "${hdr[@]}" --connect-timeout 10 --max-time 45 "$api/tarball/$sha" | tar -xz -C "$dir" --strip-components=1
+          test -f "$dir/src/run-gate.mjs"
+          claude_code=$(field claude_code_version < "$dir/engine.json")
+          [[ "$claude_code" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::engine.json claude_code_version is not x.y.z"; exit 1; }
+          codex=$(field codex_version < "$dir/engine.json")
+          [[ "$codex" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::engine.json codex_version is not x.y.z"; exit 1; }
+          { echo "sha=$sha"; echo "dir=$dir"; echo "claude_code=$claude_code"; echo "codex=$codex"; } >> "$GITHUB_OUTPUT"
+          echo "merge-policy engine $sha ($ENGINE_REF)"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.classify.outputs.skip == 'false' && needs.classify.outputs.reviewers_needed != '[]'
+        if: needs.classify.outputs.skip == 'false' && needs.classify.outputs.reviewers_needed != '[]' && inputs.dry_run != true
         continue-on-error: true
         with:
           pattern: review-*
           path: review-in
       - name: Mint the merge-bot token
         id: bot
-        if: (needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')) && vars.MERGE_BOT_CLIENT_ID != ''
+        if: (needs.classify.outputs.skip == 'false' || (needs.classify.result != 'success' && github.event_name != 'workflow_run')) && vars.MERGE_BOT_CLIENT_ID != '' && inputs.dry_run != true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
           permission-contents: write
-          permission-pull-requests: write
+          permission-pull-requests: write # arming, the owner's review request and mention
           permission-checks: write # the merge-gate check run
+      # A pass carried from an earlier head whose change this head repeats
+      # exactly (classify checked it; src/carry.mjs). Posted here because this
+      # job already holds the App token and runs no model and no PR code. A
+      # failed post leaves the verdict missing, and Decide fails closed.
+      - name: Post carried verdicts as the merge-bot App
+        if: needs.classify.result == 'success' && needs.classify.outputs.skip == 'false' && needs.classify.outputs.carried != '[]' && needs.classify.outputs.carried != '' && inputs.dry_run != true
+        continue-on-error: true
+        run: node "$RUNNER_TEMP/merge-policy/src/run-gate.mjs" carry-post
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_TOKEN: ${{ steps.bot.outputs.token }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+          REVIEWERS: ${{ needs.classify.outputs.reviewers }}
+          CARRIED: ${{ needs.classify.outputs.carried }}
       - name: Fail closed when classification did not complete
         if: needs.classify.result != 'success' && github.event_name != 'workflow_run'
-        run: node .github/merge-policy/run-gate.mjs fail-check
+        run: node "$RUNNER_TEMP/merge-policy/src/run-gate.mjs" fail-check
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_TOKEN: ${{ steps.bot.outputs.token }}
           HEAD_SHA: ${{ needs.classify.outputs.head_sha || github.event.pull_request.head.sha }}
           REASON: classify ended ${{ needs.classify.result }}
+          DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
       - name: Decide
         if: needs.classify.result == 'success' && needs.classify.outputs.skip == 'false'
-        run: node .github/merge-policy/run-gate.mjs decide
+        run: node "$RUNNER_TEMP/merge-policy/src/run-gate.mjs" decide
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_TOKEN: ${{ steps.bot.outputs.token }}
@@ -211,3 +524,59 @@ jobs:
           REASONS: ${{ needs.classify.outputs.reasons }}
           REVIEWERS: ${{ needs.classify.outputs.reviewers }}
           REVIEW_DIR: review-in
+          # A dry run decides and reports only (src/run-gate.mjs decideAndApply).
+          DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
+          MERGE_BOT_CONFIGURED: ${{ vars.MERGE_BOT_CLIENT_ID != '' }}
+      # The engine could not be fetched: nothing above decided. Post a failing
+      # merge-gate and disarm auto-merge without it (src/engine.mjs), so an
+      # earlier success or arming on this head cannot stand.
+      - name: Mint the merge-bot token (no engine)
+        id: fallback-bot
+        if: failure() && steps.engine.outcome != 'success' && inputs.dry_run != true && vars.MERGE_BOT_CLIENT_ID != ''
+        timeout-minutes: 1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MERGE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write # disarm auto-merge
+          permission-checks: write # the failing merge-gate check run
+      - name: Fail closed without the engine
+        if: failure() && steps.engine.outcome != 'success' && inputs.dry_run != true
+        timeout-minutes: 1
+        env:
+          MERGE_TOKEN: ${{ steps.fallback-bot.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.classify.outputs.pr || github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha || github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          echo "::error::the merge-policy engine could not be fetched: failing closed"
+          if [ -z "${MERGE_TOKEN:-}" ]; then echo "::error::no merge-bot token: no merge-gate check posted and auto-merge not disarmed"; exit 1; fi
+          api="https://api.github.com/repos/$REPO"
+          hdr=(--connect-timeout 5 --max-time 15 -H "Authorization: Bearer $MERGE_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          pick() { node -e 'const j = JSON.parse(require("fs").readFileSync(0, "utf8")); const v = process.argv[1].split(".").reduce((o, k) => o?.[k], j); console.log(typeof v === "string" ? v : v ? "yes" : "")' "$1"; }
+          sha="${HEAD_SHA:-}"
+          node_id=""
+          armed=""
+          if [[ "${PR_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+            if pr=$(curl -fsS "${hdr[@]}" "$api/pulls/$PR_NUMBER"); then
+              [ -n "$sha" ] || sha=$(printf '%s' "$pr" | pick head.sha)
+              node_id=$(printf '%s' "$pr" | pick node_id)
+              armed=$(printf '%s' "$pr" | pick auto_merge)
+            else
+              echo "::error::could not read PR #$PR_NUMBER: auto-merge not checked"
+            fi
+          fi
+          if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            body=$(node -e 'console.log(JSON.stringify({ name: "merge-gate", head_sha: process.argv[1], status: "completed", conclusion: "failure", details_url: process.argv[2], output: { title: "merge-gate failed closed: the merge-policy engine could not be fetched", summary: "Nothing decided this head, so it may not merge. Run: " + process.argv[2] } }))' "$sha" "$RUN_URL")
+            if curl -fsS -o /dev/null -X POST "${hdr[@]}" "$api/check-runs" -d "$body"; then echo "failing merge-gate posted on $sha"; else echo "::error::posting the failing merge-gate check failed"; fi
+          else
+            echo "::error::no head SHA: no merge-gate check posted"
+          fi
+          if [ -n "$armed" ] && [ -n "$node_id" ]; then
+            q=$(node -e 'console.log(JSON.stringify({ query: "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }", variables: { id: process.argv[1] } }))' "$node_id")
+            if res=$(curl -fsS -X POST "${hdr[@]}" https://api.github.com/graphql -d "$q") && printf '%s' "$res" | node -e 'process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).errors ? 1 : 0)'; then echo "auto-merge disarmed"; else echo "::error::disarming auto-merge failed"; fi
+          fi
+          exit 1
