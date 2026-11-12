@@ -220,6 +220,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      checks: read # a follow-up reads its earlier verdict's findings from the App's check run
     strategy:
       fail-fast: false
       matrix:
@@ -314,8 +315,9 @@ jobs:
           REASONS: ${{ needs.classify.outputs.reasons }}
           # Names only: review.mjs reads each guide from BASE_SHA's tree, never from the head.
           REVIEW_GUIDES: ${{ needs.classify.outputs.review_guides }}
-          # A follow-up review (src/delta.mjs): the earlier verdict's head, depth
-          # and findings, or null for a review of the whole PR.
+          # A follow-up review (src/delta.mjs): the earlier verdict's head, base,
+          # depth and state, or null for a review of the whole PR. Its findings
+          # are read from that verdict's check run, never passed as an output.
           DELTA: ${{ toJSON(matrix.reviewer.delta) }}
           REVIEW_OUT: review-out
           CODEX_FALLBACK: ${{ matrix.reviewer.name != 'cross' && secrets.CODEX_AUTH_JSON != '' && 'available' || '' }}
@@ -523,6 +525,8 @@ jobs:
           TIER: ${{ needs.classify.outputs.tier }}
           REASONS: ${{ needs.classify.outputs.reasons }}
           REVIEWERS: ${{ needs.classify.outputs.reviewers }}
+          # Empty only when the runner dropped it: the review matrix never ran.
+          REVIEWERS_NEEDED: ${{ needs.classify.outputs.reviewers_needed }}
           REVIEW_DIR: review-in
           # A dry run decides and reports only (src/run-gate.mjs decideAndApply).
           DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
